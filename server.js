@@ -6,6 +6,7 @@ const cors = require('cors');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,7 +30,27 @@ app.use((req, res, next) => {
 
 // ─── DATABASE ─────────────────────────────────
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'spritzmoon.db');
-const db = new Database(DB_PATH);
+
+// Ensure the directory exists (for persistent disk on Render)
+const DB_DIR = path.dirname(DB_PATH);
+if (!fs.existsSync(DB_DIR)) {
+    console.log(`📁 Creating database directory: ${DB_DIR}`);
+    try {
+        fs.mkdirSync(DB_DIR, { recursive: true });
+    } catch (e) {
+        console.error(`⚠️ Cannot create ${DB_DIR}, falling back to local directory. Error:`, e.message);
+        // Fallback: use local directory if /data doesn't exist and can't be created
+    }
+}
+
+// If directory still doesn't exist (e.g., disk not mounted yet), fall back to local
+let finalDbPath = DB_PATH;
+if (!fs.existsSync(path.dirname(finalDbPath))) {
+    finalDbPath = path.join(__dirname, 'spritzmoon.db');
+    console.log(`⚠️ Using fallback DB path: ${finalDbPath}`);
+}
+
+const db = new Database(finalDbPath);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -334,7 +355,7 @@ app.get('/api/device/history', (req, res) => {
 // ─── START ────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`🚀 SpritzMoon backend running on port ${PORT}`);
-    console.log(`📊 DB: ${DB_PATH}`);
+    console.log(`📊 DB: ${finalDbPath}`);
 });
 
 // Graceful shutdown
