@@ -84,7 +84,23 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_tx_devices ON transactions(from_device, to_device);
     CREATE INDEX IF NOT EXISTS idx_mining_device ON mining_sessions(device_id, end_time);
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
 `);
+
+// Initialize default price if not set
+const priceRow = db.prepare("SELECT value FROM settings WHERE key = 'price_eur'").get();
+if (!priceRow) {
+    db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+      .run('price_eur', '0.0001', Date.now());
+    db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+      .run('price_usd', '0.000108', Date.now());
+    console.log('💰 Default SPM price initialized: 1 SPM = €0.0001');
+}
 
 // Insert genesis block if no transactions exist
 const txCount = db.prepare('SELECT COUNT(*) as c FROM transactions').get().c;
@@ -348,6 +364,56 @@ app.get('/api/device/history', (req, res) => {
         }));
         res.json({ success: true, transactions });
     } catch (e) {
+        res.status(500).json({ success: false, error: 'Internal error' });
+    }
+});
+
+// ─── PRICE ENDPOINTS ──────────────────────────
+
+// Admin token for price updates (set in Render env vars)
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'change-me-in-render-env';
+
+// GET current SPM price (public)
+app.get('/api/price', (req, res) => {
+    try {
+        const eur = db.prepare("SELECT value, updated_at FROM settings WHERE key = 'price_eur'").get();
+        const usd = db.prepare("SELECT value FROM settings WHERE key = 'price_usd'").get();
+        res.json({
+            success: true,
+            price: {
+                eur: parseFloat(eur.value),
+                usd: parseFloat(usd ? usd.value : eur.value * 1.08),
+                updated_at: eur.updated_at,
+                disclaimer: "Internal reference value set by SpritzMoon team. Not a market price. SPM is not currently tradeable on external exchanges."
+            }
+        });
+    } catch (e) {
+        console.error('price get error:', e);
+        res.status(500).json({ success: false, error: 'Internal error' });
+    }
+});
+
+// POST update price (admin only)
+app.post('/api/admin/price', (req, res) => {
+    try {
+        const token = req.headers['x-admin-token'] || req.body.admin_token;
+        if (token !== ADMIN_TOKEN) {
+            return res.status(403).json({ success: false, error: 'Forbidden: invalid admin token' });
+        }
+        const { price_eur, price_usd } = req.body;
+        if (!price_eur || isNaN(parseFloat(price_eur)) || parseFloat(price_eur) <= 0) {
+            return res.status(400).json({ success: false, error: 'Invalid price_eur' });
+        }
+        const now = Date.now();
+        db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'price_eur'")
+          .run(price_eur.toString(), now);
+        if (price_usd && !isNaN(parseFloat(price_usd))) {
+            db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'price_usd'")
+              .run(price_usd.toString(), now);
+        }
+        res.json({ success: true, price_eur: parseFloat(price_eur), updated_at: now });
+    } catch (e) {
+        console.error('price update error:', e);
         res.status(500).json({ success: false, error: 'Internal error' });
     }
 });
