@@ -7,6 +7,63 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 const { Bot, InlineKeyboard, GrammyError, HttpError } = require('grammy');
 
+// ─── CRYPTOGRAPHIC CHAIN ──────────────────────────────────────────────
+// Verifiable hash chain: every transaction is hashed with SHA-256 and references
+// the hash of the previous transaction. Tampering with any past transaction
+// breaks the chain mathematically and is verifiable by anyone.
+//
+// CHAIN_SECRET is used to sign each transaction. Should be set via environment.
+// If not set, falls back to a default (publicly documented) — chain still works
+// but signatures are predictable. For production, ALWAYS set CHAIN_SECRET on Render.
+
+const CHAIN_SECRET = process.env.CHAIN_SECRET || 'spritzmoon-default-chain-secret-2026';
+const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+
+function computeTxHash(tx) {
+    // Deterministic serialization: each field in fixed order, then SHA-256
+    // tx must contain: id, type, from_device, to_device, amount, timestamp, block_number, prev_hash
+    const payload = [
+        tx.id,
+        tx.type,
+        tx.from_device || '',
+        tx.to_device || '',
+        Number(tx.amount).toFixed(8),
+        String(tx.timestamp),
+        String(tx.block_number || 0),
+        tx.prev_hash || GENESIS_HASH
+    ].join('|');
+    return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+function computeSignature(txHash) {
+    // HMAC-SHA256 using the chain secret as key
+    return crypto.createHmac('sha256', CHAIN_SECRET).update(txHash).digest('hex');
+}
+
+async function getLastTxHash(client) {
+    // Get the hash of the most recent transaction in the chain
+    const r = await client.query(
+        'SELECT tx_hash FROM transactions WHERE tx_hash IS NOT NULL ORDER BY timestamp DESC, id DESC LIMIT 1'
+    );
+    return r.rows.length > 0 ? r.rows[0].tx_hash : GENESIS_HASH;
+}
+
+// Insert a transaction with full crypto chain (hash, signature, prev_hash)
+async function insertChainedTransaction(client, tx) {
+    const prev_hash = await getLastTxHash(client);
+    const txWithPrev = { ...tx, prev_hash };
+    const tx_hash = computeTxHash(txWithPrev);
+    const signature = computeSignature(tx_hash);
+
+    await client.query(
+        `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [tx.id, tx.type, tx.from_device, tx.to_device, tx.amount, tx.timestamp, tx.block_number, tx_hash, signature, prev_hash]
+    );
+
+    return { tx_hash, signature, prev_hash };
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -71,9 +128,19 @@ async function initDatabase() {
                 to_device TEXT,
                 amount DOUBLE PRECISION NOT NULL,
                 timestamp BIGINT NOT NULL,
-                block_number INTEGER
+                block_number INTEGER,
+                tx_hash TEXT,
+                signature TEXT,
+                prev_hash TEXT
             );
         `);
+
+        // Add hash columns if they don't exist (migration for existing databases)
+        await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_hash TEXT;`);
+        await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS signature TEXT;`);
+        await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS prev_hash TEXT;`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_number);`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);`);
 
         // NEW: Telegram ↔ Device linking
         await client.query(`
@@ -106,12 +173,55 @@ async function initDatabase() {
 
         const txCheck = await client.query('SELECT COUNT(*) AS c FROM transactions');
         if (parseInt(txCheck.rows[0].c) === 0) {
+            const genesisId = 'GENESIS_' + Date.now();
+            const genesisTx = {
+                id: genesisId,
+                type: 'genesis',
+                from_device: 'SPRITZMOON_NETWORK',
+                to_device: 'GENESIS',
+                amount: 0,
+                timestamp: Date.now(),
+                block_number: 0,
+                prev_hash: GENESIS_HASH
+            };
+            const tx_hash = computeTxHash(genesisTx);
+            const signature = computeSignature(tx_hash);
             await client.query(
-                `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                ['GENESIS_' + Date.now(), 'genesis', 'SPRITZMOON_NETWORK', 'GENESIS', 0, Date.now(), 0]
+                `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [genesisTx.id, genesisTx.type, genesisTx.from_device, genesisTx.to_device, genesisTx.amount, genesisTx.timestamp, genesisTx.block_number, tx_hash, signature, GENESIS_HASH]
             );
-            console.log('🌟 Genesis block created');
+            console.log('🌟 Genesis block created with hash:', tx_hash.substring(0, 16) + '...');
+        }
+
+        // Backfill: any transactions without tx_hash get a hash chain retroactively
+        const unhashedCheck = await client.query(
+            'SELECT COUNT(*) AS c FROM transactions WHERE tx_hash IS NULL'
+        );
+        if (parseInt(unhashedCheck.rows[0].c) > 0) {
+            console.log(`⚠️  Found ${unhashedCheck.rows[0].c} legacy transactions without hash chain. Backfilling...`);
+            const all = await client.query(
+                'SELECT * FROM transactions WHERE tx_hash IS NULL ORDER BY timestamp ASC, id ASC'
+            );
+            let prev = GENESIS_HASH;
+            // Get the last hash from already-hashed transactions (if any)
+            const existingHashed = await client.query(
+                'SELECT tx_hash FROM transactions WHERE tx_hash IS NOT NULL AND timestamp <= $1 ORDER BY timestamp DESC, id DESC LIMIT 1',
+                [all.rows[0].timestamp]
+            );
+            if (existingHashed.rows.length > 0) prev = existingHashed.rows[0].tx_hash;
+
+            for (const row of all.rows) {
+                const tx = { ...row, prev_hash: prev };
+                const h = computeTxHash(tx);
+                const sig = computeSignature(h);
+                await client.query(
+                    'UPDATE transactions SET tx_hash = $1, signature = $2, prev_hash = $3 WHERE id = $4',
+                    [h, sig, prev, row.id]
+                );
+                prev = h;
+            }
+            console.log(`✅ Backfilled hash chain for ${all.rows.length} legacy transactions`);
         }
 
         console.log('✅ Database schema ready');
@@ -262,10 +372,15 @@ app.post('/api/mining/stop', async (req, res) => {
         try {
             await client.query('UPDATE mining_sessions SET end_time = $1, earned = $2 WHERE id = $3', [now, earned, session.id]);
             await client.query('UPDATE devices SET balance = balance + $1, last_seen = $2 WHERE device_id = $3', [earned, now, device_id]);
-            await client.query(
-                `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'mining', $2, $3, $4, $5, $6)`,
-                [makeTxId(), 'MINING_REWARD', device_id, earned, now, blockNum]
-            );
+            await insertChainedTransaction(client, {
+                id: makeTxId(),
+                type: 'mining',
+                from_device: 'MINING_REWARD',
+                to_device: device_id,
+                amount: earned,
+                timestamp: now,
+                block_number: blockNum
+            });
             await client.query('COMMIT');
         } catch (err) { await client.query('ROLLBACK'); throw err; }
         const bal = await client.query('SELECT balance FROM devices WHERE device_id = $1', [device_id]);
@@ -300,10 +415,15 @@ app.post('/api/transfer', async (req, res) => {
         try {
             await client.query('UPDATE devices SET balance = balance - $1, last_seen = $2 WHERE device_id = $3', [amt, now, from_device]);
             await client.query('UPDATE devices SET balance = balance + $1 WHERE device_id = $2', [amt, to_device]);
-            await client.query(
-                `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'transfer', $2, $3, $4, $5, $6)`,
-                [makeTxId(), from_device, to_device, amt, now, blockNum]
-            );
+            await insertChainedTransaction(client, {
+                id: makeTxId(),
+                type: 'transfer',
+                from_device: from_device,
+                to_device: to_device,
+                amount: amt,
+                timestamp: now,
+                block_number: blockNum
+            });
             await client.query('COMMIT');
         } catch (err) { await client.query('ROLLBACK'); throw err; }
         const u = await client.query('SELECT balance FROM devices WHERE device_id = $1', [from_device]);
@@ -340,16 +460,119 @@ app.post('/api/faucet/claim', async (req, res) => {
         await client.query('BEGIN');
         try {
             await client.query('UPDATE devices SET balance = balance + $1, last_faucet = $2, last_seen = $3 WHERE device_id = $4', [faucetAmount, now, now, device_id]);
-            await client.query(
-                `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'faucet', 'FAUCET', $2, $3, $4, $5)`,
-                [makeTxId(), device_id, faucetAmount, now, blockNum]
-            );
+            await insertChainedTransaction(client, {
+                id: makeTxId(),
+                type: 'faucet',
+                from_device: 'FAUCET',
+                to_device: device_id,
+                amount: faucetAmount,
+                timestamp: now,
+                block_number: blockNum
+            });
             await client.query('COMMIT');
         } catch (err) { await client.query('ROLLBACK'); throw err; }
         const u = await client.query('SELECT balance FROM devices WHERE device_id = $1', [device_id]);
         res.json({ success: true, amount: faucetAmount, balance: parseFloat(u.rows[0].balance) });
     } catch (e) { console.error('faucet:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
     finally { client.release(); }
+});
+
+// ─── PUBLIC CHAIN VERIFICATION ─────────────────────────────────────
+// Anyone can call /api/blockchain/verify to mathematically verify the entire
+// chain. Returns success:true if the chain is intact, success:false with
+// details about which transaction broke the chain (if any).
+app.get('/api/blockchain/verify', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 1000, 5000);
+        const result = await pool.query(
+            'SELECT id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash FROM transactions ORDER BY timestamp ASC, id ASC LIMIT $1',
+            [limit]
+        );
+
+        const txs = result.rows;
+        if (txs.length === 0) {
+            return res.json({ success: true, valid: true, total_checked: 0, message: 'No transactions to verify' });
+        }
+
+        let prevHash = GENESIS_HASH;
+        let invalidTx = null;
+        let checked = 0;
+
+        for (const tx of txs) {
+            checked++;
+            // Verify prev_hash matches the previous transaction's hash
+            if (tx.prev_hash !== prevHash) {
+                invalidTx = { id: tx.id, reason: 'prev_hash mismatch', expected: prevHash, found: tx.prev_hash };
+                break;
+            }
+            // Recompute the hash and compare
+            const expectedHash = computeTxHash({
+                id: tx.id,
+                type: tx.type,
+                from_device: tx.from_device,
+                to_device: tx.to_device,
+                amount: tx.amount,
+                timestamp: tx.timestamp,
+                block_number: tx.block_number,
+                prev_hash: tx.prev_hash
+            });
+            if (expectedHash !== tx.tx_hash) {
+                invalidTx = { id: tx.id, reason: 'tx_hash mismatch', expected: expectedHash, found: tx.tx_hash };
+                break;
+            }
+            // Verify signature
+            const expectedSig = computeSignature(tx.tx_hash);
+            if (expectedSig !== tx.signature) {
+                invalidTx = { id: tx.id, reason: 'signature mismatch', expected: expectedSig, found: tx.signature };
+                break;
+            }
+            prevHash = tx.tx_hash;
+        }
+
+        if (invalidTx) {
+            return res.json({
+                success: true,
+                valid: false,
+                total_checked: checked,
+                first_invalid: invalidTx,
+                message: 'Chain is broken. This indicates tampering or data corruption.'
+            });
+        }
+
+        res.json({
+            success: true,
+            valid: true,
+            total_checked: checked,
+            last_hash: prevHash,
+            message: `Chain verified successfully. ${checked} transactions form a valid cryptographic chain.`
+        });
+    } catch (e) {
+        console.error('verify chain:', e);
+        res.status(500).json({ success: false, error: 'Internal error during verification' });
+    }
+});
+
+// Get the latest chain hash (useful for external anchoring like GitHub commits)
+app.get('/api/blockchain/latest-hash', async (req, res) => {
+    try {
+        const r = await pool.query(
+            'SELECT id, tx_hash, timestamp, block_number FROM transactions WHERE tx_hash IS NOT NULL ORDER BY timestamp DESC, id DESC LIMIT 1'
+        );
+        if (r.rows.length === 0) {
+            return res.json({ success: true, hash: GENESIS_HASH, message: 'No transactions yet' });
+        }
+        res.json({
+            success: true,
+            hash: r.rows[0].tx_hash,
+            tx_id: r.rows[0].id,
+            timestamp: parseInt(r.rows[0].timestamp),
+            block_number: r.rows[0].block_number,
+            iso_time: new Date(parseInt(r.rows[0].timestamp)).toISOString()
+        });
+    } catch (e) {
+        console.error('latest-hash:', e);
+        res.status(500).json({ success: false, error: 'Internal error' });
+    }
 });
 
 app.get('/api/blockchain/stats', async (req, res) => {
@@ -433,7 +656,8 @@ app.get('/api/blockchain/transactions', async (req, res) => {
             success: true,
             transactions: r.rows.map(row => ({
                 id: row.id, type: row.type, from: row.from_device, to: row.to_device,
-                amount: parseFloat(row.amount), timestamp: parseInt(row.timestamp), block: row.block_number
+                amount: parseFloat(row.amount), timestamp: parseInt(row.timestamp), block: row.block_number,
+                tx_hash: row.tx_hash, prev_hash: row.prev_hash
             }))
         });
     } catch (e) { console.error('transactions:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
@@ -682,10 +906,15 @@ if (process.env.BOT_TOKEN) {
                 await client.query('BEGIN');
                 await client.query('UPDATE mining_sessions SET end_time = $1, earned = $2 WHERE id = $3', [now, earned, session.id]);
                 await client.query('UPDATE devices SET balance = balance + $1, last_seen = $2 WHERE device_id = $3', [earned, now, devId]);
-                await client.query(
-                    `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'mining', $2, $3, $4, $5, $6)`,
-                    [makeTxId(), 'MINING_REWARD', devId, earned, now, blockNum]
-                );
+                await insertChainedTransaction(client, {
+                    id: makeTxId(),
+                    type: 'mining',
+                    from_device: 'MINING_REWARD',
+                    to_device: devId,
+                    amount: earned,
+                    timestamp: now,
+                    block_number: blockNum
+                });
                 await client.query('COMMIT');
             } catch (err) { await client.query('ROLLBACK'); throw err; }
             finally { client.release(); }
@@ -719,10 +948,15 @@ if (process.env.BOT_TOKEN) {
                 await client.query('BEGIN');
                 await client.query('UPDATE devices SET balance = balance - $1, last_seen = $2 WHERE device_id = $3', [amt, now, devId]);
                 await client.query('UPDATE devices SET balance = balance + $1 WHERE device_id = $2', [amt, toDev]);
-                await client.query(
-                    `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'transfer', $2, $3, $4, $5, $6)`,
-                    [makeTxId(), devId, toDev, amt, now, blockNum]
-                );
+                await insertChainedTransaction(client, {
+                    id: makeTxId(),
+                    type: 'transfer',
+                    from_device: devId,
+                    to_device: toDev,
+                    amount: amt,
+                    timestamp: now,
+                    block_number: blockNum
+                });
                 await client.query('COMMIT');
             } catch (err) { await client.query('ROLLBACK'); throw err; }
             finally { client.release(); }
@@ -755,10 +989,15 @@ if (process.env.BOT_TOKEN) {
                 await client.query('BEGIN');
                 await client.query('UPDATE devices SET balance = balance + $1, last_seen = $2 WHERE device_id = $3', [reward, now, devId]);
                 await client.query('UPDATE telegram_users SET daily_streak = $1, last_daily = $2 WHERE telegram_id = $3', [newStreak, now, ctx.from.id]);
-                await client.query(
-                    `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number) VALUES ($1, 'daily', 'DAILY_BONUS', $2, $3, $4, $5)`,
-                    [makeTxId(), devId, reward, now, blockNum]
-                );
+                await insertChainedTransaction(client, {
+                    id: makeTxId(),
+                    type: 'daily',
+                    from_device: 'DAILY_BONUS',
+                    to_device: devId,
+                    amount: reward,
+                    timestamp: now,
+                    block_number: blockNum
+                });
                 await client.query('COMMIT');
             } catch (err) { await client.query('ROLLBACK'); throw err; }
             finally { client.release(); }
