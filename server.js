@@ -1,11 +1,12 @@
-// SpritzMoon Backend v2.1 — PostgreSQL + Telegram Bot
-// Node.js + Express + pg + grammY
+// SpritzMoon Backend v2.2 — PostgreSQL + Telegram Bot + Stellar Anchoring
+// Node.js + Express + pg + grammY + @stellar/stellar-sdk
 
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { Bot, InlineKeyboard, GrammyError, HttpError } = require('grammy');
+const StellarSdk = require('@stellar/stellar-sdk');
 
 // ─── CRYPTOGRAPHIC CHAIN ──────────────────────────────────────────────
 // Verifiable hash chain: every transaction is hashed with SHA-256 and references
@@ -62,6 +63,159 @@ async function insertChainedTransaction(client, tx) {
     );
 
     return { tx_hash, signature, prev_hash };
+}
+
+// ─── STELLAR ANCHORING ────────────────────────────────────────────────
+// Each day, the latest hash of the SpritzMoon chain is anchored to the
+// Stellar public blockchain by sending a tiny self-payment (1 stroop = 0.0000001 XLM)
+// with the hash as MEMO_HASH. This creates an immutable, externally-verifiable
+// proof of the SpritzMoon chain state at that time.
+//
+// Cost: ~0.00001 XLM per anchor (~0.36 XLM/year for daily anchoring)
+// Verifiable on https://stellar.expert/explorer/public/account/[STELLAR_PUBLIC_KEY]
+
+const STELLAR_PUBLIC_KEY = process.env.STELLAR_PUBLIC_KEY || null;
+const STELLAR_SECRET_KEY = process.env.STELLAR_SECRET_KEY || null;
+const STELLAR_NETWORK = process.env.STELLAR_NETWORK || 'public'; // 'public' or 'testnet'
+const STELLAR_ENABLED = !!(STELLAR_PUBLIC_KEY && STELLAR_SECRET_KEY);
+
+const stellarServer = STELLAR_ENABLED
+    ? new StellarSdk.Horizon.Server(STELLAR_NETWORK === 'testnet' ? 'https://horizon-testnet.stellar.org' : 'https://horizon.stellar.org')
+    : null;
+
+const stellarNetworkPassphrase = STELLAR_NETWORK === 'testnet'
+    ? StellarSdk.Networks.TESTNET
+    : StellarSdk.Networks.PUBLIC;
+
+if (STELLAR_ENABLED) {
+    console.log('🌟 Stellar anchoring ENABLED');
+    console.log(`   Network: ${STELLAR_NETWORK}`);
+    console.log(`   Public key: ${STELLAR_PUBLIC_KEY.substring(0, 12)}...${STELLAR_PUBLIC_KEY.substring(48)}`);
+} else {
+    console.log('⚠️  Stellar anchoring DISABLED (set STELLAR_PUBLIC_KEY and STELLAR_SECRET_KEY to enable)');
+}
+
+// Perform one anchoring operation: read the latest chain hash, send a Stellar tx
+// with that hash as MEMO_HASH, save the result in stellar_anchors table.
+async function anchorToStellar(client) {
+    if (!STELLAR_ENABLED) {
+        return { success: false, reason: 'Stellar anchoring not configured' };
+    }
+
+    try {
+        // 1. Get the latest hash of our internal chain
+        const lastTx = await client.query(
+            'SELECT id, tx_hash, timestamp, block_number FROM transactions WHERE tx_hash IS NOT NULL ORDER BY timestamp DESC, id DESC LIMIT 1'
+        );
+        if (lastTx.rows.length === 0) {
+            return { success: false, reason: 'No transactions to anchor' };
+        }
+
+        const chainHash = lastTx.rows[0].tx_hash;
+        const referencedTxId = lastTx.rows[0].id;
+        const referencedBlock = lastTx.rows[0].block_number;
+        const totalTxResult = await client.query('SELECT COUNT(*) AS c FROM transactions');
+        const totalTransactions = parseInt(totalTxResult.rows[0].c);
+
+        // 2. Load Stellar account
+        const sourceAccount = await stellarServer.loadAccount(STELLAR_PUBLIC_KEY);
+        const fee = await stellarServer.fetchBaseFee();
+
+        // 3. Build transaction with MEMO_HASH containing the chain hash
+        // chainHash is a hex string of SHA-256 (64 chars = 32 bytes), perfect for MEMO_HASH
+        const memoHash = StellarSdk.Memo.hash(chainHash);
+
+        // Send 1 stroop (0.0000001 XLM) to ourselves — minimum valid payment
+        const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+            fee: String(fee),
+            networkPassphrase: stellarNetworkPassphrase
+        })
+            .addOperation(StellarSdk.Operation.payment({
+                destination: STELLAR_PUBLIC_KEY,
+                asset: StellarSdk.Asset.native(),
+                amount: '0.0000001'
+            }))
+            .addMemo(memoHash)
+            .setTimeout(60)
+            .build();
+
+        // 4. Sign and submit
+        const signerKeypair = StellarSdk.Keypair.fromSecret(STELLAR_SECRET_KEY);
+        transaction.sign(signerKeypair);
+
+        const result = await stellarServer.submitTransaction(transaction);
+        const stellarTxHash = result.hash;
+        const ledger = result.ledger;
+        const anchoredAt = Date.now();
+
+        // 5. Save the anchor record
+        await client.query(
+            `INSERT INTO stellar_anchors (chain_hash, referenced_tx_id, referenced_block, total_transactions, stellar_tx_hash, stellar_ledger, anchored_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [chainHash, referencedTxId, referencedBlock, totalTransactions, stellarTxHash, ledger, anchoredAt]
+        );
+
+        console.log(`🌟 Stellar anchor created: ${stellarTxHash.substring(0, 16)}... (chain hash: ${chainHash.substring(0, 16)}...)`);
+
+        return {
+            success: true,
+            chain_hash: chainHash,
+            stellar_tx_hash: stellarTxHash,
+            stellar_ledger: ledger,
+            anchored_at: anchoredAt,
+            total_transactions: totalTransactions
+        };
+    } catch (e) {
+        // Stellar can fail for various reasons (network issues, account underfunded, etc.)
+        // Log but don't crash the backend
+        const errorMsg = e.response && e.response.data
+            ? JSON.stringify(e.response.data.extras || e.response.data).substring(0, 300)
+            : e.message;
+        console.error('❌ Stellar anchoring failed:', errorMsg);
+        return { success: false, reason: errorMsg };
+    }
+}
+
+// Schedule daily anchoring at 23:00 Italian time (21:00 UTC)
+function scheduleStellarAnchoring() {
+    if (!STELLAR_ENABLED) return;
+
+    const checkAndAnchor = async () => {
+        const now = new Date();
+        // Check if we should anchor: target time is 21:00 UTC (23:00 Italy)
+        const targetHourUTC = 21;
+
+        // Only anchor if we haven't already anchored today
+        const client = await pool.connect();
+        try {
+            const startOfDayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0)).getTime();
+            const todaysAnchor = await client.query(
+                'SELECT id FROM stellar_anchors WHERE anchored_at >= $1 LIMIT 1',
+                [startOfDayUTC]
+            );
+
+            if (todaysAnchor.rows.length > 0) {
+                // Already anchored today
+                return;
+            }
+
+            // It's past 21:00 UTC (23:00 IT) and we haven't anchored today → do it now
+            if (now.getUTCHours() >= targetHourUTC) {
+                console.log(`🌟 Daily Stellar anchoring triggered at ${now.toISOString()}`);
+                await anchorToStellar(client);
+            }
+        } catch (e) {
+            console.error('Stellar scheduler error:', e.message);
+        } finally {
+            client.release();
+        }
+    };
+
+    // Check every 30 minutes (catches the 23:00 IT window without flooding)
+    setInterval(checkAndAnchor, 30 * 60 * 1000);
+    // Also check 60 seconds after startup (in case backend was sleeping during the scheduled time)
+    setTimeout(checkAndAnchor, 60 * 1000);
+    console.log('⏰ Stellar anchoring scheduler started (daily at ~23:00 IT)');
 }
 
 const app = express();
@@ -165,6 +319,21 @@ async function initDatabase() {
                 achieved_at BIGINT NOT NULL
             );
         `);
+
+        // NEW: Stellar anchoring records — each row = one anchor of the SpritzMoon chain to Stellar
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS stellar_anchors (
+                id SERIAL PRIMARY KEY,
+                chain_hash TEXT NOT NULL,
+                referenced_tx_id TEXT NOT NULL,
+                referenced_block INTEGER,
+                total_transactions INTEGER NOT NULL,
+                stellar_tx_hash TEXT NOT NULL,
+                stellar_ledger BIGINT,
+                anchored_at BIGINT NOT NULL
+            );
+        `);
+        await client.query('CREATE INDEX IF NOT EXISTS idx_anchors_time ON stellar_anchors(anchored_at DESC);');
 
         await client.query('CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_tx_devices ON transactions(from_device, to_device);');
@@ -572,6 +741,99 @@ app.get('/api/blockchain/latest-hash', async (req, res) => {
     } catch (e) {
         console.error('latest-hash:', e);
         res.status(500).json({ success: false, error: 'Internal error' });
+    }
+});
+
+// ─── STELLAR ANCHORING ENDPOINTS ──────────────────────────────────
+// Get the latest Stellar anchor (used by registry widget for visual display)
+app.get('/api/blockchain/latest-anchor', async (req, res) => {
+    try {
+        const r = await pool.query(
+            'SELECT chain_hash, referenced_tx_id, referenced_block, total_transactions, stellar_tx_hash, stellar_ledger, anchored_at FROM stellar_anchors ORDER BY anchored_at DESC LIMIT 1'
+        );
+        if (r.rows.length === 0) {
+            return res.json({
+                success: true,
+                has_anchor: false,
+                stellar_enabled: STELLAR_ENABLED,
+                stellar_public_key: STELLAR_PUBLIC_KEY,
+                message: STELLAR_ENABLED
+                    ? 'Stellar anchoring enabled. First anchor will appear within 24 hours.'
+                    : 'Stellar anchoring not configured.'
+            });
+        }
+        const row = r.rows[0];
+        res.json({
+            success: true,
+            has_anchor: true,
+            stellar_enabled: STELLAR_ENABLED,
+            stellar_public_key: STELLAR_PUBLIC_KEY,
+            chain_hash: row.chain_hash,
+            referenced_tx_id: row.referenced_tx_id,
+            referenced_block: row.referenced_block,
+            total_transactions: row.total_transactions,
+            stellar_tx_hash: row.stellar_tx_hash,
+            stellar_ledger: parseInt(row.stellar_ledger),
+            anchored_at: parseInt(row.anchored_at),
+            anchored_iso: new Date(parseInt(row.anchored_at)).toISOString(),
+            stellar_explorer_url: `https://stellar.expert/explorer/public/tx/${row.stellar_tx_hash}`,
+            stellar_account_url: `https://stellar.expert/explorer/public/account/${STELLAR_PUBLIC_KEY}`
+        });
+    } catch (e) {
+        console.error('latest-anchor:', e);
+        res.status(500).json({ success: false, error: 'Internal error' });
+    }
+});
+
+// Get full history of all Stellar anchors
+app.get('/api/blockchain/anchors', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const r = await pool.query(
+            'SELECT chain_hash, referenced_tx_id, referenced_block, total_transactions, stellar_tx_hash, stellar_ledger, anchored_at FROM stellar_anchors ORDER BY anchored_at DESC LIMIT $1',
+            [limit]
+        );
+        res.json({
+            success: true,
+            stellar_enabled: STELLAR_ENABLED,
+            stellar_public_key: STELLAR_PUBLIC_KEY,
+            count: r.rows.length,
+            anchors: r.rows.map(row => ({
+                chain_hash: row.chain_hash,
+                referenced_tx_id: row.referenced_tx_id,
+                referenced_block: row.referenced_block,
+                total_transactions: row.total_transactions,
+                stellar_tx_hash: row.stellar_tx_hash,
+                stellar_ledger: parseInt(row.stellar_ledger),
+                anchored_at: parseInt(row.anchored_at),
+                stellar_explorer_url: `https://stellar.expert/explorer/public/tx/${row.stellar_tx_hash}`
+            }))
+        });
+    } catch (e) {
+        console.error('anchors:', e);
+        res.status(500).json({ success: false, error: 'Internal error' });
+    }
+});
+
+// Manually trigger an anchoring (admin-only, useful for testing or first run)
+// Requires header X-Admin-Key matching ADMIN_KEY env var
+app.post('/api/blockchain/anchor-now', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    if (!STELLAR_ENABLED) {
+        return res.status(400).json({ success: false, error: 'Stellar anchoring not configured' });
+    }
+    const client = await pool.connect();
+    try {
+        const result = await anchorToStellar(client);
+        res.json(result);
+    } catch (e) {
+        console.error('manual anchor:', e);
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
@@ -1197,6 +1459,8 @@ initDatabase()
                 });
                 console.log('🤖 Telegram bot started (polling)');
             }
+            // Activate Stellar anchoring scheduler (no-op if not configured)
+            scheduleStellarAnchoring();
         });
     })
     .catch(err => {
