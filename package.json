@@ -1,7 +1,7 @@
 {
   "name": "spritzmoon-backend",
-  "version": "2.1.0",
-  "description": "SpritzMoon blockchain backend with PostgreSQL persistence (Neon) and Telegram bot",
+  "version": "2.2.0",
+  "description": "SpritzMoon blockchain backend with PostgreSQL persistence (Neon), Telegram bot, and Stellar anchoring",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -13,7 +13,8 @@
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "pg": "^8.13.1",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "@stellar/stellar-sdk": "^12.3.0"
   },
   "author": "SpritzMoon Team",
   "license": "MIT"
