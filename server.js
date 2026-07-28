@@ -652,7 +652,7 @@ app.post('/api/faucet/claim', async (req, res) => {
 // details about which transaction broke the chain (if any).
 app.get('/api/blockchain/verify', async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit) || 1000, 5000);
+        const limit = Math.min(parseInt(req.query.limit) || 1000, 500000);
         const result = await pool.query(
             'SELECT id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash FROM transactions ORDER BY timestamp ASC, id ASC LIMIT $1',
             [limit]
