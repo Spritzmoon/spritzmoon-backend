@@ -510,16 +510,20 @@ async function computeBlockNumber() {
 // All payments are recorded as `type: 'founder_milestone'` transactions
 // in the chain, publicly visible on registry.html and anchored to Stellar.
 
-async function countFounderMilestonePayments() {
-    const r = await pool.query(
+// Accepts an optional client to run the query inside a transaction
+// (so it sees uncommitted inserts of the same transaction). Falls back to pool.
+async function countFounderMilestonePayments(client) {
+    const executor = client || pool;
+    const r = await executor.query(
         `SELECT COUNT(*) AS c FROM transactions WHERE type = $1 AND to_device = $2`,
         ['founder_milestone', FOUNDER_WALLET]
     );
     return parseInt(r.rows[0].c);
 }
 
-async function getTotalUsers() {
-    const r = await pool.query('SELECT COUNT(*) AS c FROM devices');
+async function getTotalUsers(client) {
+    const executor = client || pool;
+    const r = await executor.query('SELECT COUNT(*) AS c FROM devices');
     return parseInt(r.rows[0].c);
 }
 
@@ -553,10 +557,10 @@ async function processFounderMilestone() {
 
         await client.query('BEGIN');
 
-        const totalUsers = await getTotalUsers();
+        const totalUsers = await getTotalUsers(client);
 
         // Retroactive one-time payment
-        const paymentsMade = await countFounderMilestonePayments();
+        const paymentsMade = await countFounderMilestonePayments(client);
         if (totalUsers >= 1000 && paymentsMade === 0) {
             await ensureFounderWalletExists(client);
             await insertChainedTransaction(client, {
@@ -580,7 +584,7 @@ async function processFounderMilestone() {
         const expectedOngoing = totalUsers >= 3000 ? (Math.floor(totalUsers / MILESTONE_SIZE) - 2) : 0;
         const expectedTotal = (totalUsers >= 1000 ? 1 : 0) + Math.max(0, expectedOngoing);
 
-        let paymentsNow = await countFounderMilestonePayments();
+        let paymentsNow = await countFounderMilestonePayments(client);
         while (paymentsNow < expectedTotal) {
             // This payment is the (paymentsNow - 1 + 3)-th thousand threshold crossed, i.e. 3K, 4K, 5K...
             const milestoneCrossed = (paymentsNow - 1 + 3) * MILESTONE_SIZE;
