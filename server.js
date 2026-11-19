@@ -545,6 +545,12 @@ async function ensureFounderWalletExists(client) {
 async function processFounderMilestone() {
     const client = await pool.connect();
     try {
+        // Advisory lock: ensures no two parallel executions of this function
+        // can run at the same time (prevents race conditions when boot + first
+        // registration trigger milestones simultaneously).
+        // Lock key 777777 is arbitrary but constant; any value works.
+        await client.query('SELECT pg_advisory_lock(777777)');
+
         await client.query('BEGIN');
 
         const totalUsers = await getTotalUsers();
@@ -601,6 +607,8 @@ async function processFounderMilestone() {
         await client.query('ROLLBACK');
         console.error('processFounderMilestone error:', e);
     } finally {
+        // Always release the advisory lock, even on error
+        try { await client.query('SELECT pg_advisory_unlock(777777)'); } catch (_) {}
         client.release();
     }
 }
