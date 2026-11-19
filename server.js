@@ -13,12 +13,32 @@ const StellarSdk = require('@stellar/stellar-sdk');
 // the hash of the previous transaction. Tampering with any past transaction
 // breaks the chain mathematically and is verifiable by anyone.
 //
-// CHAIN_SECRET is used to sign each transaction. Should be set via environment.
-// If not set, falls back to a default (publicly documented) — chain still works
-// but signatures are predictable. For production, ALWAYS set CHAIN_SECRET on Render.
+// CHAIN_SECRET is used to sign each transaction via HMAC-SHA256.
+// MUST be set as environment variable. The server refuses to start without it.
+// Generate a secure value with: openssl rand -hex 32
 
-const CHAIN_SECRET = process.env.CHAIN_SECRET || 'spritzmoon-default-chain-secret-2026';
+if (!process.env.CHAIN_SECRET) {
+    console.error('❌ FATAL: CHAIN_SECRET environment variable is not set.');
+    console.error('   Generate one with: openssl rand -hex 32');
+    console.error('   Then set it in your hosting environment variables.');
+    process.exit(1);
+}
+const CHAIN_SECRET = process.env.CHAIN_SECRET;
 const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+
+// ─── FOUNDER MILESTONE PROGRAM ──────────────────────────────
+// Publicly declared reward program for the project founder.
+// At each 1,000 registered-users threshold crossed, the founder wallet
+// receives MILESTONE_BONUS SPM. This rule is part of the open-source
+// protocol and visible to anyone reading the code or the public ledger.
+// All milestone bonuses are recorded as `type: 'founder_milestone'`
+// transactions in the chain and anchored to Stellar like any other TX.
+// See README.md and partner.html for public documentation.
+
+const FOUNDER_WALLET = 'SPM_N5JEQVO7_8B5R8C_17';
+const MILESTONE_SIZE = 1000;      // users per milestone
+const MILESTONE_BONUS = 50000;    // SPM per milestone crossed
+const RETROACTIVE_BONUS = 50000;  // one-time retroactive recognition at launch of the program
 
 function computeTxHash(tx) {
     // Deterministic serialization: each field in fixed order, then SHA-256
@@ -50,19 +70,26 @@ async function getLastTxHash(client) {
 }
 
 // Insert a transaction with full crypto chain (hash, signature, prev_hash)
+// Optional `tx.metadata` (string or object) is stored in the metadata column.
 async function insertChainedTransaction(client, tx) {
     const prev_hash = await getLastTxHash(client);
     const txWithPrev = { ...tx, prev_hash };
     const tx_hash = computeTxHash(txWithPrev);
     const signature = computeSignature(tx_hash);
 
+    // Auto-generate a transaction id if the caller didn't provide one.
+    const id = tx.id || `${tx.type || 'tx'}_${tx.timestamp}_${crypto.randomBytes(4).toString('hex')}`;
+    const metadata = tx.metadata
+        ? (typeof tx.metadata === 'string' ? tx.metadata : JSON.stringify(tx.metadata))
+        : null;
+
     await client.query(
-        `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [tx.id, tx.type, tx.from_device, tx.to_device, tx.amount, tx.timestamp, tx.block_number, tx_hash, signature, prev_hash]
+        `INSERT INTO transactions (id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [id, tx.type, tx.from_device, tx.to_device, tx.amount, tx.timestamp, tx.block_number, tx_hash, signature, prev_hash, metadata]
     );
 
-    return { tx_hash, signature, prev_hash };
+    return { id, tx_hash, signature, prev_hash };
 }
 
 // ─── STELLAR ANCHORING ────────────────────────────────────────────────
@@ -293,8 +320,11 @@ async function initDatabase() {
         await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_hash TEXT;`);
         await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS signature TEXT;`);
         await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS prev_hash TEXT;`);
+        // Metadata column for programmatic transaction types (e.g. founder_milestone)
+        await client.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS metadata TEXT;`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_transactions_block ON transactions(block_number);`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);`);
 
         // NEW: Telegram ↔ Device linking
         await client.query(`
@@ -470,6 +500,108 @@ async function computeBlockNumber() {
     return Math.floor(parseInt(r.rows[0].c) / 5) + 1;
 }
 
+// ─── FOUNDER MILESTONE PROGRAM ───────────────────
+// Logic for the publicly declared Founder Milestone Bonus.
+// Rule declared in README.md: 50,000 SPM retroactive (one-time) + 50,000 SPM
+// for each 1,000-user milestone crossed from 3,000 onwards.
+// All payments are recorded as `type: 'founder_milestone'` transactions
+// in the chain, publicly visible on registry.html and anchored to Stellar.
+
+async function countFounderMilestonePayments() {
+    const r = await pool.query(
+        `SELECT COUNT(*) AS c FROM transactions WHERE type = $1 AND to_device = $2`,
+        ['founder_milestone', FOUNDER_WALLET]
+    );
+    return parseInt(r.rows[0].c);
+}
+
+async function getTotalUsers() {
+    const r = await pool.query('SELECT COUNT(*) AS c FROM devices');
+    return parseInt(r.rows[0].c);
+}
+
+async function ensureFounderWalletExists(client) {
+    const check = await client.query('SELECT 1 FROM devices WHERE device_id = $1', [FOUNDER_WALLET]);
+    if (check.rows.length === 0) {
+        await client.query(
+            `INSERT INTO devices (device_id, balance, created_at, last_seen) VALUES ($1, 0, $2, $2)`,
+            [FOUNDER_WALLET, Date.now()]
+        );
+        console.log(`🪙 Founder wallet registered: ${FOUNDER_WALLET}`);
+    }
+}
+
+/**
+ * Checks if a new 1,000-user milestone has been crossed and issues
+ * founder_milestone transactions as needed. Called after each new registration.
+ * Expected total payments:
+ *   - 1 retroactive bonus (one-time) if users >= 1000
+ *   - 1 bonus for each milestone >= 3000 crossed (3K, 4K, 5K, ...)
+ * (Milestones 1K and 2K are considered covered by the retroactive bonus.)
+ */
+async function processFounderMilestone() {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const totalUsers = await getTotalUsers();
+
+        // Retroactive one-time payment
+        const paymentsMade = await countFounderMilestonePayments();
+        if (totalUsers >= 1000 && paymentsMade === 0) {
+            await ensureFounderWalletExists(client);
+            await insertChainedTransaction(client, {
+                type: 'founder_milestone',
+                from_device: null,
+                to_device: FOUNDER_WALLET,
+                amount: RETROACTIVE_BONUS,
+                timestamp: Date.now(),
+                block_number: await computeBlockNumber(),
+                metadata: JSON.stringify({ milestone: 'retroactive', users_at_time: totalUsers })
+            });
+            await client.query(
+                `UPDATE devices SET balance = balance + $1 WHERE device_id = $2`,
+                [RETROACTIVE_BONUS, FOUNDER_WALLET]
+            );
+            console.log(`🪙 Founder retroactive milestone paid: ${RETROACTIVE_BONUS} SPM (users: ${totalUsers})`);
+        }
+
+        // Ongoing milestones from 3K onwards
+        // expectedOngoing = how many 1K thresholds >= 3K have been crossed
+        const expectedOngoing = totalUsers >= 3000 ? (Math.floor(totalUsers / MILESTONE_SIZE) - 2) : 0;
+        const expectedTotal = (totalUsers >= 1000 ? 1 : 0) + Math.max(0, expectedOngoing);
+
+        let paymentsNow = await countFounderMilestonePayments();
+        while (paymentsNow < expectedTotal) {
+            // This payment is the (paymentsNow - 1 + 3)-th thousand threshold crossed, i.e. 3K, 4K, 5K...
+            const milestoneCrossed = (paymentsNow - 1 + 3) * MILESTONE_SIZE;
+            await ensureFounderWalletExists(client);
+            await insertChainedTransaction(client, {
+                type: 'founder_milestone',
+                from_device: null,
+                to_device: FOUNDER_WALLET,
+                amount: MILESTONE_BONUS,
+                timestamp: Date.now(),
+                block_number: await computeBlockNumber(),
+                metadata: JSON.stringify({ milestone: milestoneCrossed, users_at_time: totalUsers })
+            });
+            await client.query(
+                `UPDATE devices SET balance = balance + $1 WHERE device_id = $2`,
+                [MILESTONE_BONUS, FOUNDER_WALLET]
+            );
+            console.log(`🪙 Founder milestone paid: ${MILESTONE_BONUS} SPM (threshold: ${milestoneCrossed} users)`);
+            paymentsNow++;
+        }
+
+        await client.query('COMMIT');
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('processFounderMilestone error:', e);
+    } finally {
+        client.release();
+    }
+}
+
 // ─── HTTP ENDPOINTS ───────────────────────────
 
 app.get('/', (req, res) => {
@@ -482,6 +614,10 @@ app.post('/api/device/register', async (req, res) => {
         if (!validDeviceId(device_id)) return res.status(400).json({ success: false, error: 'Invalid device ID' });
         const device = await getOrCreateDevice(device_id);
         res.json({ success: true, balance: parseFloat(device.balance), device_id });
+
+        // Fire-and-forget: check for founder milestone after responding to the user.
+        // Isolated in its own try/catch so it never affects user registration.
+        processFounderMilestone().catch(err => console.error('milestone check failed:', err));
     } catch (e) { console.error('register:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
 });
 
@@ -652,7 +788,7 @@ app.post('/api/faucet/claim', async (req, res) => {
 // details about which transaction broke the chain (if any).
 app.get('/api/blockchain/verify', async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit) || 1000, 500000);
+        const limit = Math.min(parseInt(req.query.limit) || 1000, 100000);
         const result = await pool.query(
             'SELECT id, type, from_device, to_device, amount, timestamp, block_number, tx_hash, signature, prev_hash FROM transactions ORDER BY timestamp ASC, id ASC LIMIT $1',
             [limit]
@@ -923,6 +1059,41 @@ app.get('/api/blockchain/transactions', async (req, res) => {
             }))
         });
     } catch (e) { console.error('transactions:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
+});
+
+// Public endpoint: full history of Founder Milestone Program payments.
+// Allows anyone to audit how much and when the founder wallet has received
+// under the publicly declared milestone bonus rule. See README.md.
+app.get('/api/blockchain/founder-milestones', async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT * FROM transactions WHERE type = $1 AND to_device = $2 ORDER BY timestamp ASC`,
+            ['founder_milestone', FOUNDER_WALLET]
+        );
+        const totalUsers = await getTotalUsers();
+        const totalPaid = r.rows.reduce((sum, row) => sum + parseFloat(row.amount), 0);
+        res.json({
+            success: true,
+            founder_wallet: FOUNDER_WALLET,
+            rule: {
+                retroactive_bonus: RETROACTIVE_BONUS,
+                milestone_size: MILESTONE_SIZE,
+                milestone_bonus: MILESTONE_BONUS,
+                description: `${RETROACTIVE_BONUS} SPM one-time retroactive bonus + ${MILESTONE_BONUS} SPM per ${MILESTONE_SIZE}-user milestone crossed from 3,000 onwards.`
+            },
+            current_users: totalUsers,
+            next_milestone_at: totalUsers >= 2000 ? (Math.floor(totalUsers / MILESTONE_SIZE) + 1) * MILESTONE_SIZE : null,
+            total_paid_to_founder: totalPaid,
+            payments: r.rows.map(row => ({
+                id: row.id,
+                amount: parseFloat(row.amount),
+                timestamp: parseInt(row.timestamp),
+                block: row.block_number,
+                tx_hash: row.tx_hash,
+                metadata: row.metadata ? JSON.parse(row.metadata) : null
+            }))
+        });
+    } catch (e) { console.error('founder-milestones:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
 });
 
 app.get('/api/device/history', async (req, res) => {
@@ -1461,6 +1632,9 @@ initDatabase()
             }
             // Activate Stellar anchoring scheduler (no-op if not configured)
             scheduleStellarAnchoring();
+            // Run founder milestone check at boot (catches retroactive payment
+            // and any milestones crossed while the server was down).
+            processFounderMilestone().catch(err => console.error('milestone boot check failed:', err));
         });
     })
     .catch(err => {
