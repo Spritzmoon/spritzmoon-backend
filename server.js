@@ -72,13 +72,16 @@ async function getLastTxHash(client) {
 // Insert a transaction with full crypto chain (hash, signature, prev_hash)
 // Optional `tx.metadata` (string or object) is stored in the metadata column.
 async function insertChainedTransaction(client, tx) {
+    // Auto-generate a transaction id if the caller didn't provide one.
+    // CRITICAL: must be generated BEFORE computing the hash, because
+    // computeTxHash() includes tx.id in the signed payload.
+    const id = tx.id || `${tx.type || 'tx'}_${tx.timestamp}_${crypto.randomBytes(4).toString('hex')}`;
+
     const prev_hash = await getLastTxHash(client);
-    const txWithPrev = { ...tx, prev_hash };
+    const txWithPrev = { ...tx, id, prev_hash };
     const tx_hash = computeTxHash(txWithPrev);
     const signature = computeSignature(tx_hash);
 
-    // Auto-generate a transaction id if the caller didn't provide one.
-    const id = tx.id || `${tx.type || 'tx'}_${tx.timestamp}_${crypto.randomBytes(4).toString('hex')}`;
     const metadata = tx.metadata
         ? (typeof tx.metadata === 'string' ? tx.metadata : JSON.stringify(tx.metadata))
         : null;
