@@ -1111,6 +1111,69 @@ app.get('/api/blockchain/founder-milestones', async (req, res) => {
     } catch (e) { console.error('founder-milestones:', e); res.status(500).json({ success: false, error: 'Internal error' }); }
 });
 
+// ─── ADMIN: REBUILD CHAIN ─────────────────────────────────
+// Recomputes tx_hash, signature and prev_hash for every transaction,
+// in timestamp order. Use after manual DB operations that may have
+// left the hash chain inconsistent. Returns a report of what was done.
+// Protected by ADMIN_KEY.
+app.post('/api/admin/rebuild-chain', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'] || req.query.key || req.body?.key;
+    if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Load all transactions in chronological order
+        const r = await client.query(
+            `SELECT id, type, from_device, to_device, amount, timestamp, block_number
+             FROM transactions
+             ORDER BY timestamp ASC, id ASC`
+        );
+
+        let prev_hash = GENESIS_HASH;
+        let updated = 0;
+
+        for (const row of r.rows) {
+            const txObj = {
+                id: row.id,
+                type: row.type,
+                from_device: row.from_device,
+                to_device: row.to_device,
+                amount: parseFloat(row.amount),
+                timestamp: parseInt(row.timestamp),
+                block_number: row.block_number,
+                prev_hash
+            };
+            const tx_hash = computeTxHash(txObj);
+            const signature = computeSignature(tx_hash);
+
+            await client.query(
+                `UPDATE transactions SET tx_hash = $1, signature = $2, prev_hash = $3 WHERE id = $4`,
+                [tx_hash, signature, prev_hash, row.id]
+            );
+
+            prev_hash = tx_hash;
+            updated++;
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            success: true,
+            transactions_updated: updated,
+            new_latest_hash: prev_hash
+        });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        console.error('rebuild-chain:', e);
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/device/history', async (req, res) => {
     try {
         const { device_id } = req.query;
